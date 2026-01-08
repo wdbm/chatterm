@@ -1,0 +1,1016 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+################################################################################
+#                                                                              #
+# chatterm                                                                     #
+#                                                                              #
+################################################################################
+#                                                                              #
+# LICENCE INFORMATION                                                          #
+#                                                                              #
+# This programme is a two-pane GUI terminal which runs terminal commands from  #
+# chat-style input and captures outputs, with inputs and outputs represented   #
+# in timestamped, copyable message bubbles, with session logging and basic     #
+# syntax highlighting.                                                         #
+#                                                                              #
+# copyright (C) 2025 Will Breaden Madden, wbm@protonmail.ch                    #
+#                                                                              #
+# This software is released under the terms of the GNU General Public License  #
+# version 3 (GPLv3).                                                           #
+#                                                                              #
+# This programme is free software: one can redistribute it and/or modify it    #
+# under the terms of the GNU General Public License as published by the Free   #
+# Software Foundation, either version 3 of the Licence, or (at your option)    #
+# any later version.                                                           #
+#                                                                              #
+# This programme is distributed in the hope that it will be useful, but WITHOUT#
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or        #
+# FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for     #
+# more details.                                                                #
+#                                                                              #
+# For a copy of the GNU General Public Licence, see                            #
+# <http://www.gnu.org/licenses>.                                               #
+#                                                                              #
+################################################################################
+"""
+
+from dataclasses import dataclass
+import errno
+import fcntl
+import os
+import pty
+import re
+import sys
+import signal
+import subprocess
+import time
+from typing import Optional, List, Tuple
+
+from pygments import highlight
+from pygments.lexers import BashLexer, TextLexer
+from pygments.formatters import HtmlFormatter
+from PySide6 import QtCore, QtGui, QtWidgets
+
+
+def utc_timestamp_iso_seconds() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime())
+
+
+def uuid4t8() -> str:
+    """
+    Return an 8-character tag derived from UUID4 with at least one letter.
+    """
+    import uuid
+    while True:
+        s = str(uuid.uuid4()).replace("-", "")[:8]
+        if re.search(r"[a-fA-F]", s):
+            return s
+
+
+def strip_ansi(s: str) -> str:
+    """
+    Remove common ANSI/VT escape sequences (with minimal code).
+    """
+    ansi_re = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+    s = ansi_re.sub("", s)
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    return s
+
+
+@dataclass
+class SessionEntry:
+    timestamp: str
+    kind: str # "command" or "output" or "note"
+    text: str
+
+
+class BashHighlighter(QtGui.QSyntaxHighlighter):
+    """
+    Minimal Bash highlighter for the input editor
+    """
+    def __init__(self, doc: QtGui.QTextDocument):
+        super().__init__(doc)
+
+        def fmt(**kwargs):
+            f = QtGui.QTextCharFormat()
+            if "foreground" in kwargs:
+                f.setForeground(kwargs["foreground"])
+            if "font_weight" in kwargs:
+                f.setFontWeight(kwargs["font_weight"])
+            if "italic" in kwargs and kwargs["italic"]:
+                f.setFontItalic(True)
+            return f
+
+        self.formats = {
+            "comment":  fmt(foreground=QtGui.QColor("#6A9955"), italic=True),
+            "string":   fmt(foreground=QtGui.QColor("#CE9178")),
+            "keyword":  fmt(foreground=QtGui.QColor("#569CD6"), font_weight=QtGui.QFont.Bold),
+            "variable": fmt(foreground=QtGui.QColor("#9CDCFE")),
+        }
+
+        self.rules: List[Tuple[re.Pattern, QtGui.QTextCharFormat]] = []
+
+        keywords = [
+            "if", "then", "else", "elif", "fi",
+            "for", "in", "do", "done",
+            "while", "until", "case", "esac",
+            "function", "select", "time",
+            "return", "break", "continue",
+            "export", "local", "readonly",
+        ]
+        kw_re = r"\b(" + "|".join(map(re.escape, keywords)) + r")\b"
+        self.rules.append((re.compile(kw_re), self.formats["keyword"]))
+
+        self.rules.append((re.compile(r"#.*$"), self.formats["comment"]))
+        self.rules.append((re.compile(r"(?<!\\)\".*?(?<!\\)\""), self.formats["string"]))
+        self.rules.append((re.compile(r"(?<!\\)'.*?(?<!\\)'"), self.formats["string"]))
+        self.rules.append((re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}"), self.formats["variable"]))
+        self.rules.append((re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*"), self.formats["variable"]))
+
+    def highlightBlock(self, text: str) -> None:
+        for pattern, f in self.rules:
+            for m in pattern.finditer(text):
+                start = m.start()
+                length = m.end() - m.start()
+                self.setFormat(start, length, f)
+
+
+class StreamHighlighter(QtGui.QSyntaxHighlighter):
+    """
+    Pragmatic highlighter for terminal stream text which colourises log-
+    like patterns:
+    - timestamps
+    - errors/warnings
+    - exit codes
+    - paths
+    - quoted strings
+    - common prompts
+    """
+    def __init__(self, doc: QtGui.QTextDocument):
+        super().__init__(doc)
+
+        def mkfmt(colour_hex: str, bold: bool = False, italic: bool = False) -> QtGui.QTextCharFormat:
+            f = QtGui.QTextCharFormat()
+            f.setForeground(QtGui.QColor(colour_hex))
+            if bold:
+                f.setFontWeight(QtGui.QFont.Bold)
+            if italic:
+                f.setFontItalic(True)
+            return f
+
+        self.fmt_timestamp = mkfmt("#9CDCFE", bold=True)
+        self.fmt_error     = mkfmt("#F44747", bold=True)
+        self.fmt_warning   = mkfmt("#FFCC00", bold=True)
+        self.fmt_success   = mkfmt("#6A9955", bold=True)
+        self.fmt_exit_ok   = mkfmt("#6A9955", bold=True)
+        self.fmt_exit_bad  = mkfmt("#F44747", bold=True)
+
+        self.fmt_prompt    = mkfmt("#C586C0", bold=True)
+        self.fmt_path      = mkfmt("#CE9178")
+        self.fmt_quoted    = mkfmt("#D7BA7D")
+
+        # Patterns are applied in order.
+        self.rules: List[Tuple[re.Pattern, QtGui.QTextCharFormat]] = []
+
+        # Timestamps
+        self.rules.append((re.compile(r"\b\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}Z\b"), self.fmt_timestamp))
+
+        # Common prompt shapes: user@host:...$ or bash-5.1$ etc.
+        self.rules.append((re.compile(r"(^|\s)([A-Za-z0-9_.-]+@?[A-Za-z0-9_.-]*:[^\s]*[$#])"), self.fmt_prompt))
+        self.rules.append((re.compile(r"\bbash-\d+(\.\d+)*[$#]\b"), self.fmt_prompt))
+
+        # Exit code marker
+        self.rules.append((re.compile(r"\(exit code 0\)"), self.fmt_exit_ok))
+        self.rules.append((re.compile(r"\(exit code [1-9]\d*\)"), self.fmt_exit_bad))
+
+        # Error/warning keywords (case-insensitive)
+        self.rules.append((re.compile(r"\b(error|failed|failure|exception|traceback|fatal)\b", re.IGNORECASE), self.fmt_error))
+        self.rules.append((re.compile(r"\b(warn|warning|deprecated)\b", re.IGNORECASE), self.fmt_warning))
+        self.rules.append((re.compile(r"\b(ok|success|passed)\b", re.IGNORECASE), self.fmt_success))
+
+        # Paths: /usr/bin, ./relative, ../relative, ~/home-ish
+        self.rules.append((re.compile(r"(?:(?:\.\./)|(?:\./)|(?:/)|(?:~/))[A-Za-z0-9._~/-]+"), self.fmt_path))
+
+        # Quoted strings
+        self.rules.append((re.compile(r"(?<!\\)\".*?(?<!\\)\""), self.fmt_quoted))
+        self.rules.append((re.compile(r"(?<!\\)'.*?(?<!\\)'"), self.fmt_quoted))
+
+    def highlightBlock(self, text: str) -> None:
+        for pattern, fmt in self.rules:
+            for m in pattern.finditer(text):
+                start = m.start()
+                length = m.end() - m.start()
+                self.setFormat(start, length, fmt)
+
+
+class SendOnShiftEnterFilter(QtCore.QObject):
+    """
+    Event filter for the command input widget:
+    - Shift+Enter sends
+    - Enter inserts newline
+    """
+    send_requested = QtCore.Signal()
+
+    def eventFilter(self, obj, event):
+        if event.type() == QtCore.QEvent.KeyPress:
+            if isinstance(event, QtGui.QKeyEvent):
+                if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+                    mods = event.modifiers()
+                    if mods & QtCore.Qt.ShiftModifier:
+                        self.send_requested.emit()
+                        return True
+                    return False
+        return super().eventFilter(obj, event)
+
+
+class PtyShell(QtCore.QObject):
+    """
+    Persistent Bash shell connected to a PTY
+
+    - Commands are wrapped with begin/end markers for capture.
+    - Raw key sending is supported for interactive programmes.
+    """
+    data_received     = QtCore.Signal(str) # raw text chunk
+    command_completed = QtCore.Signal(str, str, int) # tag, captured_output, exit_code
+    command_started   = QtCore.Signal(str) # tag
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.master_fd: Optional[int] = None
+        self.slave_fd: Optional[int] = None
+        self.proc: Optional[subprocess.Popen] = None
+        self.notifier: Optional[QtCore.QSocketNotifier] = None
+
+        self._buffer = ""
+        self._active_tag: Optional[str] = None
+        self._capture_started = False
+        self._capture_text_parts: List[str] = []
+
+        self._begin_re = re.compile(r"^__CHATTERM_BEGIN_([0-9a-fA-F]{8})__$")
+        self._end_re   = re.compile(r"^__CHATTERM_END_([0-9a-fA-F]{8})__:(-?\d+)$")
+
+    def start(self) -> None:
+        if self.proc is not None:
+            return
+
+        master_fd, slave_fd = pty.openpty()
+
+        flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+        fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+        env = os.environ.copy()
+        env["TERM"] = env.get("TERM", "xterm-256color")
+
+        self.proc = subprocess.Popen(
+            ["bash", "--noprofile", "--norc", "-i"],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            start_new_session=True,
+            env=env,
+            close_fds=True,
+        )
+
+        self.master_fd = master_fd
+        self.slave_fd = slave_fd
+
+        self.notifier = QtCore.QSocketNotifier(self.master_fd, QtCore.QSocketNotifier.Read)
+        self.notifier.activated.connect(self._on_read_ready)
+
+        # Reduce prompt noise and avoid echoing injected commands.
+        self._write_raw("stty -echo\n")
+        self._write_raw("PS1=''\n")
+        self._write_raw("export PROMPT_COMMAND=''\n")
+
+    def stop(self) -> None:
+        if self.notifier is not None:
+            self.notifier.setEnabled(False)
+            self.notifier.deleteLater()
+            self.notifier = None
+
+        if self.proc is not None:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            except Exception:
+                pass
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+
+        for fd in [self.master_fd, self.slave_fd]:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+
+        self.proc = None
+        self.master_fd = None
+        self.slave_fd = None
+
+    def send_command(self, command_text: str) -> str:
+        if self.proc is None:
+            self.start()
+
+        tag                      = uuid4t8()
+        self._active_tag         = tag
+        self._capture_started    = False
+        self._capture_text_parts = []
+
+        self.command_started.emit(tag)
+
+        safe_cmd = command_text.rstrip("\n")
+
+        payload = (
+            f"echo __CHATTERM_BEGIN_{tag}__\n"
+            f"{safe_cmd}\n"
+            f"__ec__=$?\n"
+            f"echo __CHATTERM_END_{tag}__:${{__ec__}}\n"
+        )
+        self._write_raw(payload)
+        return tag
+
+    def send_keys(self, s: str) -> None:
+        """
+        Send raw keys/text to the PTY session.
+
+        This is intended for interactive programmes, e.g. htop.
+        """
+        self._write_raw(s)
+
+    def send_ctrl_c(self) -> None:
+        self._write_bytes(b"\x03")
+
+    def send_ctrl_d(self) -> None:
+        self._write_bytes(b"\x04")
+
+    def terminate_process_group(self) -> None:
+        """
+        Send SIGTERM to the Bash process group.
+
+        This is an escape mechanism for an interactive programme which
+        has trapped the session.
+        """
+        if self.proc is None:
+            return
+        try:
+            os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+        except Exception:
+            pass
+
+    def _write_raw(self, s: str) -> None:
+        self._write_bytes(s.encode("utf-8", errors="replace"))
+
+    def _write_bytes(self, b: bytes) -> None:
+        if self.master_fd is None:
+            return
+        try:
+            os.write(self.master_fd, b)
+        except OSError as e:
+            if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise
+
+    def _on_read_ready(self) -> None:
+        if self.master_fd is None:
+            return
+
+        while True:
+            try:
+                chunk = os.read(self.master_fd, 4096)
+                if not chunk:
+                    break
+            except OSError as e:
+                if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    break
+                break
+
+            text = chunk.decode("utf-8", errors="replace")
+            self.data_received.emit(text)
+            self._consume_for_capture(text)
+
+    def _consume_for_capture(self, text: str) -> None:
+        # Strip control sequences to make markers reliable.
+        self._buffer += strip_ansi(text)
+
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            line_stripped = line.strip()
+
+            m_begin = self._begin_re.match(line_stripped)
+            if m_begin:
+                tag = m_begin.group(1)
+                if self._active_tag == tag:
+                    self._capture_started = True
+                    self._capture_text_parts = []
+                continue
+
+            m_end = self._end_re.match(line_stripped)
+            if m_end:
+                tag = m_end.group(1)
+                exit_code = int(m_end.group(2))
+                if self._active_tag == tag:
+                    captured = "\n".join(self._capture_text_parts).rstrip()
+                    self._active_tag = None
+                    self._capture_started = False
+                    self._capture_text_parts = []
+                    self.command_completed.emit(tag, captured, exit_code)
+                continue
+
+            if self._capture_started and self._active_tag is not None:
+                self._capture_text_parts.append(line)
+
+
+class BubbleWidget(QtWidgets.QWidget):
+    def __init__(self, side: str, timestamp: str, text: str, is_command: bool, parent=None):
+        super().__init__(parent)
+        self.side = side
+        self.timestamp = timestamp
+        self.text = text
+        self.is_command = is_command
+
+        outer = QtWidgets.QHBoxLayout(self)
+        outer.setContentsMargins(8, 2, 8, 2)
+
+        self.bubble = QtWidgets.QFrame()
+        self.bubble.setObjectName("bubbleFrame")
+        bubble_layout = QtWidgets.QVBoxLayout(self.bubble)
+        bubble_layout.setContentsMargins(12, 10, 12, 10)
+        bubble_layout.setSpacing(6)
+
+        header = QtWidgets.QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+
+        ts_label = QtWidgets.QLabel(timestamp)
+        ts_label.setObjectName("timestampLabel")
+        header.addWidget(ts_label)
+
+        header.addStretch(1)
+
+        copy_btn = QtWidgets.QToolButton()
+        copy_btn.setText("Copy")
+        copy_btn.setToolTip("Copy this message to clipboard")
+        copy_btn.clicked.connect(self._copy_to_clipboard)
+        header.addWidget(copy_btn)
+
+        bubble_layout.addLayout(header)
+
+        self.viewer = QtWidgets.QTextBrowser()
+        self.viewer.setProperty("bubbleSide", side)
+        self.viewer.setOpenExternalLinks(False)
+        self.viewer.setObjectName("bubbleText")
+        self.viewer.setReadOnly(True)
+        self.viewer.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.viewer.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+
+        self._set_content(text, is_command=is_command)
+        bubble_layout.addWidget(self.viewer)
+
+        if side == "right":
+            outer.addStretch(1)
+            outer.addWidget(self.bubble, 0)
+        else:
+            outer.addWidget(self.bubble, 0)
+            outer.addStretch(1)
+
+        self._apply_style(side)
+
+        # Enable layout-driven resizing with widths defined by the main
+        # window.
+        self.bubble.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Minimum)
+
+    def set_width_constraints(self, min_width: int, max_width: int) -> None:
+        self.bubble.setMinimumWidth(max(200, int(min_width)))
+        self.bubble.setMaximumWidth(max(220, int(max_width)))
+
+    def _apply_style(self, side: str) -> None:
+        # Dark mode colours
+        if side == "right":
+            bubble_bg = "#0033a0"
+        else:
+            bubble_bg = "#3B3B3B"
+        if side == "right":
+            sb_track = "rgba(0, 0, 0, 0.18)"
+            sb_handle = "rgba(255, 255, 255, 0.25)"
+            sb_handle_hover = "rgba(255, 255, 255, 0.35)"
+        else:
+            sb_track = "rgba(0, 0, 0, 0.18)"
+            sb_handle = "rgba(255, 255, 255, 0.18)"
+            sb_handle_hover = "rgba(255, 255, 255, 0.28)"
+
+        # Light foreground for readability
+        fg = "#F2F2F2"
+        border = "#222222"
+        ts_fg = "#D0D0D0"
+
+        self.setStyleSheet(f"""
+            QLabel#timestampLabel {{
+                color: {ts_fg};
+                font-size: 11px;
+            }}
+            QFrame#bubbleFrame {{
+                background-color: {bubble_bg};
+                border-radius: 12px;
+                border: 1px solid {border};
+            }}
+            QTextBrowser#bubbleText {{
+                border: none;
+                background: transparent;
+                color: {fg};
+                font-family: monospace;
+                font-size: 12px;
+            }}
+            QToolButton {{
+                color: {fg};
+                background: rgba(255, 255, 255, 0.08);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 6px;
+                padding: 2px 8px;
+            }}
+            QToolButton:hover {{
+                background: rgba(255, 255, 255, 0.14);
+            }}
+            QTextBrowser#bubbleText QScrollBar:vertical {{
+                background: {sb_track};
+                width: 10px;
+                margin: 0px;
+                border: none;
+            }}
+            QTextBrowser#bubbleText QScrollBar::handle:vertical {{
+                background: {sb_handle};
+                border-radius: 5px;
+                min-height: 18px;
+            }}
+            QTextBrowser#bubbleText QScrollBar::handle:vertical:hover {{
+                background: {sb_handle_hover};
+            }}
+            QTextBrowser#bubbleText QScrollBar::add-line:vertical,
+            QTextBrowser#bubbleText QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
+            QTextBrowser#bubbleText QScrollBar::add-page:vertical,
+            QTextBrowser#bubbleText QScrollBar::sub-page:vertical {{
+                background: none;
+            }}
+
+            QTextBrowser#bubbleText QScrollBar:horizontal {{
+                background: {sb_track};
+                height: 10px;
+                margin: 0px;
+                border: none;
+            }}
+            QTextBrowser#bubbleText QScrollBar::handle:horizontal {{
+                background: {sb_handle};
+                border-radius: 5px;
+                min-width: 18px;
+            }}
+            QTextBrowser#bubbleText QScrollBar::handle:horizontal:hover {{
+                background: {sb_handle_hover};
+            }}
+            QTextBrowser#bubbleText QScrollBar::add-line:horizontal,
+            QTextBrowser#bubbleText QScrollBar::sub-line:horizontal {{
+                width: 0px;
+            }}
+            QTextBrowser#bubbleText QScrollBar::add-page:horizontal,
+            QTextBrowser#bubbleText QScrollBar::sub-page:horizontal {{
+                background: none;
+            }}
+        """)
+
+    def _set_content(self, text: str, is_command: bool) -> None:
+        if is_command:
+            html = self._pygments_html(text, lexer=BashLexer())
+        else:
+            html = self._pygments_html(text, lexer=TextLexer())
+        self.viewer.setHtml(html)
+
+    def _pygments_html(self, text: str, lexer) -> str:
+        formatter = HtmlFormatter(nowrap=False, style="monokai")
+        highlighted = highlight(text, lexer, formatter)
+        css = formatter.get_style_defs(".highlight")
+
+        # Keep backgrounds transparent so the bubble colour is visible.
+        html = f"""
+            <html>
+            <head>
+                <style>
+                    {css}
+                    body {{
+                        margin: 0;
+                        padding: 0;
+                        background: transparent;
+                    }}
+                    .highlight {{
+                        white-space: pre-wrap;
+                        word-wrap: break-word;
+                        background: transparent;
+                    }}
+                    pre {{
+                        margin: 0;
+                        background: transparent !important;
+                    }}
+                </style>
+            </head>
+            <body>
+                {highlighted}
+            </body>
+            </html>
+        """
+        return html
+
+    def _copy_to_clipboard(self) -> None:
+        cb = QtWidgets.QApplication.clipboard()
+        cb.setText(self.text)
+
+
+class ChatTerminalMainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("chatterm")
+        self.resize(1100, 780)
+
+        self.session_log: List[SessionEntry] = []
+
+        self.shell = PtyShell(self)
+        self.shell.data_received.connect(self._on_stream_data)
+        self.shell.command_completed.connect(self._on_command_completed)
+        self.shell.start()
+
+        self._build_ui()
+        self._apply_global_style()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        try:
+            self.shell.stop()
+        finally:
+            super().closeEvent(event)
+
+    def _build_ui(self) -> None:
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+
+        main_layout = QtWidgets.QVBoxLayout(central)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(8)
+
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+
+        self.stream_view = QtWidgets.QPlainTextEdit()
+        self.stream_view.setReadOnly(True)
+        self.stream_view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        self.stream_view.setObjectName("streamView")
+        self.stream_view.setPlaceholderText("Live stream output (ANSI/VT sequences are stripped)")
+        font = QtGui.QFont("Monospace")
+        font.setStyleHint(QtGui.QFont.TypeWriter)
+        self.stream_view.setFont(font)
+
+        self.stream_highlighter = StreamHighlighter(self.stream_view.document())
+
+        self.chat_scroll = QtWidgets.QScrollArea()
+        self.chat_scroll.setWidgetResizable(True)
+        self.chat_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+
+        self.chat_container = QtWidgets.QWidget()
+        self.chat_container.setObjectName("chatContainer")
+        self.chat_layout = QtWidgets.QVBoxLayout(self.chat_container)
+        self.chat_layout.setContentsMargins(6, 6, 6, 6)
+        self.chat_layout.setSpacing(6)
+        self.chat_layout.addStretch(1)
+
+        self.chat_scroll.setWidget(self.chat_container)
+
+        self.splitter.addWidget(self.stream_view)
+        self.splitter.addWidget(self.chat_scroll)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 3)
+        self.splitter.setSizes([220, 540])
+
+        main_layout.addWidget(self.splitter, 1)
+
+        # Command input row
+        input_row = QtWidgets.QHBoxLayout()
+        input_row.setContentsMargins(0, 0, 0, 0)
+        input_row.setSpacing(8)
+
+        self.input_edit = QtWidgets.QPlainTextEdit()
+        self.input_edit.setPlaceholderText("Type a Bash command. Shift+Enter sends; Enter inserts a newline.")
+        self.input_edit.setFixedHeight(92)
+        self.input_edit.setFont(font)
+        self.input_highlighter = BashHighlighter(self.input_edit.document())
+
+        self.send_filter = SendOnShiftEnterFilter(self.input_edit)
+        self.send_filter.send_requested.connect(self._send_command_from_input)
+        self.input_edit.installEventFilter(self.send_filter)
+
+        self.send_btn = QtWidgets.QPushButton("Send")
+        self.send_btn.setToolTip("Send the command (same as Shift+Enter)")
+        self.send_btn.clicked.connect(self._send_command_from_input)
+
+        input_row.addWidget(self.input_edit, 1)
+        input_row.addWidget(self.send_btn, 0)
+
+        main_layout.addLayout(input_row)
+
+        # Raw keys row (for interactive programmes)
+        keys_row = QtWidgets.QHBoxLayout()
+        keys_row.setContentsMargins(0, 0, 0, 0)
+        keys_row.setSpacing(8)
+
+        self.keys_edit = QtWidgets.QLineEdit()
+        self.keys_edit.setPlaceholderText("Send keys to the running session (e.g. q to exit top). Press Enter to send.")
+        self.keys_edit.returnPressed.connect(self._send_keys_from_field)
+
+        self.keys_send_btn = QtWidgets.QPushButton("Send keys")
+        self.keys_send_btn.clicked.connect(self._send_keys_from_field)
+
+        keys_row.addWidget(self.keys_edit, 1)
+        keys_row.addWidget(self.keys_send_btn, 0)
+
+        main_layout.addLayout(keys_row)
+
+        # Toolbar controls
+        toolbar = QtWidgets.QToolBar("Controls")
+        toolbar.setMovable(False)
+        self.addToolBar(toolbar)
+
+        self.toggle_stream_action = QtGui.QAction("Hide stream pane", self)
+        self.toggle_stream_action.triggered.connect(self._toggle_stream_pane)
+        toolbar.addAction(self.toggle_stream_action)
+
+        toolbar.addSeparator()
+
+        ctrlc_action = QtGui.QAction("Send Ctrl+C", self)
+        ctrlc_action.triggered.connect(self.shell.send_ctrl_c)
+        toolbar.addAction(ctrlc_action)
+
+        ctrld_action = QtGui.QAction("Send Ctrl+D", self)
+        ctrld_action.triggered.connect(self.shell.send_ctrl_d)
+        toolbar.addAction(ctrld_action)
+
+        term_action = QtGui.QAction("Terminate job", self)
+        term_action.setToolTip("Send SIGTERM to the shell process group (strong escape hatch)")
+        term_action.triggered.connect(self.shell.terminate_process_group)
+        toolbar.addAction(term_action)
+
+        toolbar.addSeparator()
+
+        save_action = QtGui.QAction("Save session log…", self)
+        save_action.triggered.connect(self._save_session_log)
+        toolbar.addAction(save_action)
+
+        clear_action = QtGui.QAction("Clear chat", self)
+        clear_action.triggered.connect(self._clear_chat)
+        toolbar.addAction(clear_action)
+
+    def _apply_global_style(self) -> None:
+        self.setStyleSheet("""
+            QMainWindow {
+                background: #3b3b3b;
+            }
+            QWidget#chatContainer {
+                background: #000000;
+            }
+            QScrollArea {
+                background: #000000;
+                border: none;
+            }
+
+            QToolBar {
+                background: #2b2b2b;
+                border-bottom: 1px solid #222222;
+                spacing: 6px;
+            }
+            QToolButton {
+                background: #2b2b2b;
+                color: #f2f2f2;
+                border: 1px solid #222222;
+                border-radius: 6px;
+                padding: 6px 10px;
+            }
+            QToolButton:hover {
+                background: #333333;
+            }
+            QToolButton:pressed {
+                background: #3a3a3a;
+            }
+
+            QPushButton {
+                background: #2b2b2b;
+                color: #f2f2f2;
+                border: 1px solid #222222;
+                border-radius: 6px;
+                padding: 6px 10px;
+            }
+            QPushButton:hover {
+                background: #333333;
+            }
+
+            QPlainTextEdit#streamView {
+                background: #0f0f0f;
+                color: #e6e6e6;
+                border: 1px solid #222222;
+                border-radius: 6px;
+                padding: 6px;
+                font-family: monospace;
+                font-size: 12px;
+            }
+            QPlainTextEdit {
+                background: #1f1f1f;
+                color: #f2f2f2;
+                border: 1px solid #222222;
+                border-radius: 6px;
+                padding: 6px;
+                font-family: monospace;
+            }
+            QLineEdit {
+                background: #1f1f1f;
+                color: #f2f2f2;
+                border: 1px solid #222222;
+                border-radius: 6px;
+                padding: 6px;
+            }
+
+            /* Scrollbars (global defaults; overridden for bubble viewers below) */
+            QScrollBar:vertical {
+                background: #3B3B3B;
+                width: 12px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: #5a5a5a;
+                border-radius: 6px;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #6a6a6a;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: none;
+            }
+
+            QScrollBar:horizontal {
+                background: #3B3B3B;
+                height: 12px;
+                margin: 0px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #5a5a5a;
+                border-radius: 6px;
+                min-width: 20px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #6a6a6a;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background: none;
+            }
+        """)
+
+    def _append_bubble(self, side: str, timestamp: str, text: str, is_command: bool) -> None:
+        stretch_item = self.chat_layout.takeAt(self.chat_layout.count() - 1)
+        bubble = BubbleWidget(side=side, timestamp=timestamp, text=text, is_command=is_command)
+        self.chat_layout.addWidget(bubble)
+        if stretch_item is not None:
+            self.chat_layout.addItem(stretch_item)
+        self._update_bubble_widths()
+        # Scroll after the widget is added, and again after the layout
+        # settles.
+        QtCore.QTimer.singleShot(0, self._scroll_chat_to_bottom)
+        QtCore.QTimer.singleShot(50, self._scroll_chat_to_bottom)
+
+    def _scroll_chat_to_bottom(self) -> None:
+        bar = self.chat_scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _send_command_from_input(self) -> None:
+        cmd = self.input_edit.toPlainText().rstrip()
+        if not cmd:
+            return
+
+        ts = utc_timestamp_iso_seconds()
+
+        self._append_bubble(side="right", timestamp=ts, text=cmd, is_command=True)
+        self.session_log.append(SessionEntry(timestamp=ts, kind="command", text=cmd))
+
+        self.shell.send_command(cmd)
+
+        self.input_edit.clear()
+        self.input_edit.setFocus()
+
+    def _send_keys_from_field(self) -> None:
+        s = self.keys_edit.text()
+        if s == "":
+            return
+
+        # Send as if typed, followed by Enter.
+        self.shell.send_keys(s + "\n")
+
+        ts = utc_timestamp_iso_seconds()
+        self.session_log.append(SessionEntry(timestamp=ts, kind="note", text=f"Sent keys: {s!r}"))
+
+        self.keys_edit.clear()
+        self.keys_edit.setFocus()
+
+    @QtCore.Slot(str)
+    def _on_stream_data(self, text: str) -> None:
+        # Strip ANSI/VT control sequences for a cleaner stream pane.
+        clean = strip_ansi(text)
+
+        cursor = self.stream_view.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.End)
+        cursor.insertText(clean)
+        self.stream_view.setTextCursor(cursor)
+        self.stream_view.ensureCursorVisible()
+
+    @QtCore.Slot(str, str, int)
+    def _on_command_completed(self, tag: str, captured_output: str, exit_code: int) -> None:
+        ts = utc_timestamp_iso_seconds()
+
+        output_text = captured_output
+        if output_text.strip() == "":
+            output_text = f"(no captured output; exit code {exit_code})"
+        else:
+            output_text = f"{output_text}\n\n(exit code {exit_code})"
+
+        self._append_bubble(side="left", timestamp=ts, text=output_text, is_command=False)
+        self.session_log.append(SessionEntry(timestamp=ts, kind="output", text=output_text))
+
+    def _toggle_stream_pane(self) -> None:
+        stream_is_visible = self.stream_view.isVisible()
+        if stream_is_visible:
+            self.stream_view.setVisible(False)
+            self.toggle_stream_action.setText("Show stream pane")
+        else:
+            self.stream_view.setVisible(True)
+            self.toggle_stream_action.setText("Hide stream pane")
+            self.splitter.setSizes([220, 540])
+
+    def _save_session_log(self) -> None:
+        default_name = f"chat-terminal-session-{time.strftime('%Y-%m-%dT%H%M%SZ', time.gmtime())}.txt"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save session log",
+            default_name,
+            "Text files (*.txt);;All files (*)",
+        )
+        if not path:
+            return
+
+        lines = []
+        for entry in self.session_log:
+            lines.append(f"[{entry.timestamp}] {entry.kind}\n{entry.text}\n")
+
+        payload = "\n".join(lines).rstrip() + "\n"
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(payload)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save failed", f"Could not write file:\n{e}")
+            return
+
+        QtWidgets.QMessageBox.information(self, "Saved", f"Session log saved at:\n{path}")
+
+    def _clear_chat(self) -> None:
+        while self.chat_layout.count() > 1:
+            item = self.chat_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self.session_log.append(SessionEntry(timestamp=utc_timestamp_iso_seconds(), kind="note", text="Chat cleared"))
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._update_bubble_widths()
+
+    def _update_bubble_widths(self) -> None:
+        viewport_w = self.chat_scroll.viewport().width()
+        if viewport_w <= 0:
+            return
+
+        min_w = int(viewport_w * 0.75)
+        max_w = int(viewport_w * 0.95)
+
+        for i in range(self.chat_layout.count()):
+            item = self.chat_layout.itemAt(i)
+            w = item.widget()
+            if isinstance(w, BubbleWidget):
+                w.set_width_constraints(min_w, max_w)
+
+
+def main() -> int:
+    app = QtWidgets.QApplication(sys.argv)
+    win = ChatTerminalMainWindow()
+    win.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
